@@ -1,8 +1,10 @@
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnNullable.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/IFunction.h>
@@ -28,14 +30,14 @@ constexpr size_t arg_separators = 2;
 
 std::unique_ptr<ITokenExtractor> createTokenizer(const ColumnsWithTypeAndName & arguments, std::string_view name)
 {
-    const auto tokenizer_arg = arguments.size() < 2 ? DefaultTokenExtractor::getExternalName()
-                                                        : arguments[arg_tokenizer].column->getDataAt(0).toView();
+    const auto tokenizer_arg = arguments.size() < 2 ? SplitByNonAlphaTokenExtractor::getExternalName()
+                                                        : arguments[arg_tokenizer].column->getDataAt(0);
 
-    if (tokenizer_arg == DefaultTokenExtractor::getExternalName())
+    if (tokenizer_arg == SplitByNonAlphaTokenExtractor::getExternalName())
     {
-        return std::make_unique<DefaultTokenExtractor>();
+        return std::make_unique<SplitByNonAlphaTokenExtractor>();
     }
-    if (tokenizer_arg == SplitTokenExtractor::getExternalName())
+    if (tokenizer_arg == SplitByStringTokenExtractor::getExternalName())
     {
         std::vector<String> separators;
         if (arguments.size() < 3)
@@ -60,20 +62,20 @@ std::unique_ptr<ITokenExtractor> createTokenizer(const ColumnsWithTypeAndName & 
                 separators.emplace_back(separator.safeGet<String>());
         }
 
-        return std::make_unique<SplitTokenExtractor>(separators);
+        return std::make_unique<SplitByStringTokenExtractor>(separators);
     }
-    if (tokenizer_arg == NoOpTokenExtractor::getExternalName())
+    if (tokenizer_arg == ArrayTokenExtractor::getExternalName())
     {
-        return std::make_unique<NoOpTokenExtractor>();
+        return std::make_unique<ArrayTokenExtractor>();
     }
-    if (tokenizer_arg == NgramTokenExtractor::getExternalName())
+    if (tokenizer_arg == NgramsTokenExtractor::getExternalName())
     {
         auto ngrams = (arguments.size() < 3) ? 3 : arguments[arg_ngrams].column->getUInt(0);
         if (ngrams < 2 || ngrams > 8)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Ngrams argument of function {} should be between 2 and 8, got: {}", name, ngrams);
-        return std::make_unique<NgramTokenExtractor>(ngrams);
+        return std::make_unique<NgramsTokenExtractor>(ngrams);
     }
-    if (tokenizer_arg == SparseGramTokenExtractor::getExternalName())
+    if (tokenizer_arg == SparseGramsTokenExtractor::getExternalName())
     {
         auto min_length = arguments.size() < 3 ? 3
             : arguments[2].column->getUInt(0);
@@ -82,7 +84,7 @@ std::unique_ptr<ITokenExtractor> createTokenizer(const ColumnsWithTypeAndName & 
         auto min_cutoff_length = arguments.size() < 5 ? std::nullopt
             : std::optional(arguments[4].column->getUInt(0));
 
-        return std::make_unique<SparseGramTokenExtractor>(min_length, max_length, min_cutoff_length);
+        return std::make_unique<SparseGramsTokenExtractor>(min_length, max_length, min_cutoff_length);
     }
 
     throw Exception(
@@ -102,27 +104,36 @@ public:
 
     String getName() const override { return name; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    bool useDefaultImplementationForNulls() const override { return false; }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
         auto col_input = arguments[arg_value].column;
+
+        // Handle Nullable columns - extract nested column and null map
+        const ColumnNullable * col_nullable = checkAndGetColumn<ColumnNullable>(col_input.get());
+        const NullMap * null_map_data = nullptr;
+
+        if (col_nullable)
+        {
+            null_map_data = &col_nullable->getNullMapData();
+            col_input = col_nullable->getNestedColumnPtr();
+        }
+
         auto col_result = ColumnString::create();
         auto col_offsets = ColumnArray::ColumnOffsets::create();
 
         if (input_rows_count == 0)
             return ColumnArray::create(std::move(col_result), std::move(col_offsets));
 
-        if (token_extractor->getType() == ITokenExtractor::Type::SparseGram)
+        if (token_extractor->getType() == ITokenExtractor::Type::SparseGrams)
         {
-            /// The sparse gram token extractor stores an internal state which modified during the execution.
-            /// This leads to an error while executing this function multi-threaded because that state is not protected.
-            /// To avoid this case, a clone of the sparse gram token extractor will be used.
             auto sparse_gram_extractor = token_extractor->clone();
-            executeWithTokenizer(*sparse_gram_extractor, std::move(col_input), *col_offsets, input_rows_count, *col_result);
+            executeWithTokenizer(*sparse_gram_extractor, std::move(col_input), *col_offsets, input_rows_count, *col_result, null_map_data);
         }
         else
         {
-            executeWithTokenizer(*token_extractor, std::move(col_input), *col_offsets, input_rows_count, *col_result);
+            executeWithTokenizer(*token_extractor, std::move(col_input), *col_offsets, input_rows_count, *col_result, null_map_data);
         }
 
         return ColumnArray::create(std::move(col_result), std::move(col_offsets));
@@ -134,12 +145,13 @@ private:
         ColumnPtr col_input,
         ColumnArray::ColumnOffsets & col_offsets,
         size_t input_rows_count,
-        ColumnString & col_result) const
+        ColumnString & col_result,
+        const NullMap * null_map_data) const
     {
         if (const auto * column_string = checkAndGetColumn<ColumnString>(col_input.get()))
-            executeImpl(extractor, *column_string, col_offsets, input_rows_count, col_result);
+            executeImpl(extractor, *column_string, col_offsets, input_rows_count, col_result, null_map_data);
         else if (const auto * column_fixed_string = checkAndGetColumn<ColumnFixedString>(col_input.get()))
-            executeImpl(extractor, *column_fixed_string, col_offsets, input_rows_count, col_result);
+            executeImpl(extractor, *column_fixed_string, col_offsets, input_rows_count, col_result, null_map_data);
     }
 
     template <typename StringColumnType>
@@ -148,7 +160,8 @@ private:
         const StringColumnType & column_input,
         ColumnArray::ColumnOffsets & column_offsets_input,
         size_t input_rows_count,
-        ColumnString & column_result) const
+        ColumnString & column_result,
+        const NullMap * null_map_data) const
     {
         auto & offsets_data = column_offsets_input.getData();
         offsets_data.resize(input_rows_count);
@@ -156,7 +169,14 @@ private:
 
         for (size_t i = 0; i < input_rows_count; ++i)
         {
-            std::string_view input = column_input.getDataAt(i).toView();
+            // If this row is NULL, output empty array
+            if (null_map_data && (*null_map_data)[i])
+            {
+                offsets_data[i] = tokens_count;
+                continue;
+            }
+
+            std::string_view input = column_input.getDataAt(i);
 
             forEachTokenPadded(extractor, input.data(), input.size(), [&](const char * token_start, size_t token_len)
             {
@@ -209,6 +229,7 @@ public:
     size_t getNumberOfArguments() const override { return 0; }
     bool isVariadic() const override { return true; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1, 2}; }
+    bool useDefaultImplementationForNulls() const override { return false; }
 
     static FunctionOverloadResolverPtr create(ContextPtr)
     {
@@ -217,31 +238,38 @@ public:
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
+        // Remove Nullable wrapper from the first argument for validation
+        DataTypePtr value_type = removeNullable(arguments[arg_value].type);
+
         FunctionArgumentDescriptors mandatory_args{
             {"value", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isStringOrFixedString), nullptr, "String or FixedString"}};
 
         FunctionArgumentDescriptors optional_args;
 
+        // Create a copy of arguments with non-nullable type for validation
+        ColumnsWithTypeAndName args_for_validation = arguments;
+        args_for_validation[arg_value].type = value_type;
+
         if (arguments.size() > 1)
         {
             optional_args.emplace_back("tokenizer", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isString), isColumnConst, "String");
-            validateFunctionArguments(name, {arguments[arg_value], arguments[arg_tokenizer]}, mandatory_args, optional_args);
+            validateFunctionArguments(name, {args_for_validation[arg_value], args_for_validation[arg_tokenizer]}, mandatory_args, optional_args);
 
             if (arguments.size() == 3)
             {
-                const auto tokenizer = arguments[arg_tokenizer].column->getDataAt(0).toString();
+                const std::string tokenizer{arguments[arg_tokenizer].column->getDataAt(0)};
 
-                if (tokenizer == NgramTokenExtractor::getExternalName())
+                if (tokenizer == NgramsTokenExtractor::getExternalName())
                     optional_args.emplace_back("ngrams", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isUInt8), isColumnConst, "const UInt8");
-                else if (tokenizer == SplitTokenExtractor::getExternalName())
+                else if (tokenizer == SplitByStringTokenExtractor::getExternalName())
                     optional_args.emplace_back("separators", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isArray), isColumnConst, "const Array");
             }
 
             if (arguments.size() == 4 || arguments.size() == 5)
             {
-                const auto tokenizer = arguments[arg_tokenizer].column->getDataAt(0).toString();
+                const auto tokenizer = arguments[arg_tokenizer].column->getDataAt(0);
 
-                if (tokenizer == SparseGramTokenExtractor::getExternalName())
+                if (tokenizer == SparseGramsTokenExtractor::getExternalName())
                 {
                     optional_args.emplace_back("min_length", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isUInt8), isColumnConst, "UInt8");
                     optional_args.emplace_back("max_length", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isUInt8), isColumnConst, "UInt8");
@@ -251,7 +279,7 @@ public:
             }
         }
 
-        validateFunctionArguments(name, arguments, mandatory_args, optional_args);
+        validateFunctionArguments(name, args_for_validation, mandatory_args, optional_args);
         return std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>());
     }
 
@@ -271,18 +299,20 @@ REGISTER_FUNCTION(Tokens)
 Splits a string into tokens using the given tokenizer.
 The default tokenizer uses non-alphanumeric ASCII characters as separators.
 
+For NULL input values, the function returns an empty array.
+
 In case of the `split` tokenizer, if the tokens do not form a [prefix code](https://en.wikipedia.org/wiki/Prefix_code), you likely want that the matching prefers longer separators first.
 To do so, pass the separators in order of descending length.
 For example, with separators = `['%21', '%']` string `%21abc` would be tokenized as `['abc']`, whereas separators = `['%', '%21']` would tokenize to `['21ac']` (which is likely not what you wanted).
 )";
     FunctionDocumentation::Syntax syntax = "tokens(value[, tokenizer[, ngrams[, separators]]])";
     FunctionDocumentation::Arguments arguments = {
-        {"value", "The input string.", {"String", "FixedString"}},
-        {"tokenizer", "The tokenizer to use. Valid arguments are `default`, `ngram`, `split`, and `no_op`. Optional, if not set explicitly, defaults to `default`.", {"const String"}},
-        {"ngrams", "Only relevant if argument `tokenizer` is `ngram`: An optional parameter which defines the length of the ngrams. If not set explicitly, defaults to `3`.", {"const UInt8"}},
+        {"value", "The input string. NULL values return an empty array.", {"String", "FixedString", "Nullable(String)", "Nullable(FixedString)"}},
+        {"tokenizer", "The tokenizer to use. Valid arguments are `splitByNonAlpha`, `ngrams`, `splitByString`, `array`, and `sparseGrams`. Optional, if not set explicitly, defaults to `splitByNonAlpha`.", {"const String"}},
+        {"ngrams", "Only relevant if argument `tokenizer` is `ngrams`: An optional parameter which defines the length of the ngrams. If not set explicitly, defaults to `3`.", {"const UInt8"}},
         {"separators", "Only relevant if argument `tokenizer` is `split`: An optional parameter which defines the separator strings. If not set explicitly, defaults to `[' ']`.", {"const Array(String)"}}
     };
-    FunctionDocumentation::ReturnedValue returned_value = {"Returns the resulting array of tokens from input string.", {"Array"}};
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the resulting array of tokens from input string. Returns an empty array for NULL inputs.", {"Array"}};
     FunctionDocumentation::Examples examples = {
     {
         "Default tokenizer",
@@ -293,9 +323,16 @@ For example, with separators = `['%21', '%']` string `%21abc` would be tokenized
     },
     {
         "Ngram tokenizer",
-        "SELECT tokens('abc def', 'ngram', 3) AS tokens;",
+        "SELECT tokens('abc def', 'ngrams', 3) AS tokens;",
         R"(
 ['abc','bc ','c d',' de','def']
+        )"
+    },
+    {
+        "Nullable input",
+        "SELECT tokens(NULL) AS tokens;",
+        R"(
+[]
         )"
     }
     };
